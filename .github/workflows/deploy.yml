@@ -1,0 +1,82 @@
+# Salvar em: .github/workflows/deploy.yml
+# Deploy automatico do site estatico para S3 + invalidacao CloudFront.
+# Autenticacao via OIDC (sem Access Keys). Role: GitHubDeploy-MarcenariaSampa
+# (stack CloudFormation gha-deploy-marcenariasampa). O ARN nao e segredo; a role so
+# aceita tokens deste repo no environment "production" (criado automaticamente no 1o run).
+
+name: Deploy site
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write   # necessario para OIDC
+  contents: read
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false   # nunca interrompe um deploy em andamento
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: production
+    env:
+      AWS_ROLE_ARN: arn:aws:iam::316356488279:role/GitHubDeploy-MarcenariaSampa
+      AWS_REGION: us-east-1
+      S3_BUCKET: marcenariasampa-site
+      CLOUDFRONT_DISTRIBUTION_ID: EXB6XVW42XF8R
+      SITE_DIR: .
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Trava de seguranca: nao publica se o index.html nao estiver no repo
+      - name: Validar conteudo do site
+        run: test -f "$SITE_DIR/index.html" || { echo "::error::index.html ausente no repo - deploy abortado"; exit 1; }
+
+      - name: Credenciais AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-${{ github.run_id }}
+
+      # 1) Assets (css, js, imagens, fontes): cache de 1 dia no navegador
+      - name: Sync assets
+        run: |
+          set -f   # sem expansao de glob nos padroes
+          EXCLUDES=(--exclude ".git/*" --exclude ".github/*" --exclude ".devcontainer/*" --exclude ".vscode/*" --exclude "*.md" --exclude ".gitignore" --exclude ".DS_Store" --exclude "*.yaml" --exclude "*.yml")
+          aws s3 sync "$SITE_DIR" "s3://${S3_BUCKET}" \
+            "${EXCLUDES[@]}" \
+            --exclude "*.html" \
+            --cache-control "public, max-age=86400" \
+            --only-show-errors
+          # --delete NAO habilitado (e a role nao tem s3:DeleteObject).
+
+      # 2) HTML: sempre revalida, para o conteudo novo aparecer na hora
+      - name: Sync HTML
+        run: |
+          set -f   # sem expansao de glob nos padroes
+          EXCLUDES=(--exclude ".git/*" --exclude ".github/*" --exclude ".devcontainer/*" --exclude ".vscode/*" --exclude "*.md" --exclude ".gitignore" --exclude ".DS_Store" --exclude "*.yaml" --exclude "*.yml")
+          aws s3 sync "$SITE_DIR" "s3://${S3_BUCKET}" \
+            "${EXCLUDES[@]}" \
+            --exclude "*" --include "*.html" \
+            --cache-control "no-cache" \
+            --content-type "text/html; charset=utf-8" \
+            --only-show-errors
+
+      - name: Invalidar CloudFront
+        run: |
+          ID=$(aws cloudfront create-invalidation \
+            --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" \
+            --paths "/*" --query 'Invalidation.Id' --output text)
+          echo "Invalidacao: $ID"
+          aws cloudfront wait invalidation-completed \
+            --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" --id "$ID"
+
+      - name: Resumo
+        run: echo "Deploy ${{ github.sha }} publicado em s3://${S3_BUCKET}" >> "$GITHUB_STEP_SUMMARY"
